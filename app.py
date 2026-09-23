@@ -8,8 +8,10 @@ infrlo 容器默认命令为:
 本脚本让 komari（Go 预编译单二进制，前端已内嵌）无需改动平台默认命令即可部署：
   - 构建阶段执行 `python app.py --download-only`，提前从 GitHub Releases
     下载当前架构的 komari 二进制（失败不影响构建，运行时会重试）。
-  - 运行阶段 `python app.py` 下载（如缺失）后以 execv 替换自身，
-    启动 `./komari server`，并自动适配平台注入的 PORT 端口。
+  - 运行阶段 `python3 app.py` 下载（如缺失）后启动 `./komari server`。
+    若平台注入 PORT 则直接监听该端口；否则 komari 监听内部端口
+    25774，并在 80/3000/5000/8000/8080 上做 TCP 转发兜底，
+    适配平台网关固定转发到某个端口的场景。
 
 可用环境变量（均在 infrlo 容器设置页配置）:
   PORT                  平台注入的监听端口（默认 25774）
@@ -92,9 +94,12 @@ def download(force: bool = False) -> None:
     print(f"[komari] saved {BIN} ({len(data)} bytes)")
 
 
-def build_server_cmd() -> list:
-    port = os.environ.get("PORT", "25774")
-    listen = os.environ.get("KOMARI_LISTEN") or f"0.0.0.0:{port}"
+INTERNAL_PORT = 25774
+# 平台网关可能转发的常见入口端口；绑定失败的端口自动跳过
+EXTRA_PORTS = (80, 3000, 5000, 8000, 8080)
+
+
+def build_server_cmd(listen: str) -> list:
     cmd = [BIN, "server", "--listen", listen]
     database = os.environ.get("KOMARI_DATABASE", "").strip()
     if database:
@@ -103,6 +108,57 @@ def build_server_cmd() -> list:
     if extra:
         cmd += extra.split()
     return cmd
+
+
+def start_port_forwarders(internal_port: int, ports) -> None:
+    """在额外入口端口上起 TCP 转发，全部指向容器内的 komari 端口。"""
+    import socket
+    import threading
+
+    def pipe(src, dst):
+        try:
+            while True:
+                data = src.recv(65536)
+                if not data:
+                    break
+                dst.sendall(data)
+        except OSError:
+            pass
+        finally:
+            try:
+                src.shutdown(socket.SHUT_RDWR)
+            except OSError:
+                pass
+            try:
+                dst.shutdown(socket.SHUT_RDWR)
+            except OSError:
+                pass
+
+    def forward(listen_port: int) -> None:
+        srv = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        try:
+            srv.bind(("0.0.0.0", listen_port))
+        except OSError as exc:
+            print(f"[komari] forwarder skip port {listen_port}: {exc}")
+            return
+        srv.listen(128)
+        print(f"[komari] forwarding 0.0.0.0:{listen_port} -> 127.0.0.1:{internal_port}")
+        while True:
+            try:
+                client, _ = srv.accept()
+            except OSError:
+                return
+            try:
+                upstream = socket.create_connection(("127.0.0.1", internal_port), timeout=10)
+            except OSError:
+                client.close()
+                continue
+            threading.Thread(target=pipe, args=(client, upstream), daemon=True).start()
+            threading.Thread(target=pipe, args=(upstream, client), daemon=True).start()
+
+    for port in ports:
+        threading.Thread(target=forward, args=(port,), daemon=True).start()
 
 
 def main() -> None:
@@ -119,10 +175,32 @@ def main() -> None:
     if download_only:
         return
 
+    import signal
+    import subprocess
+
     os.environ.setdefault("GIN_MODE", "release")
-    cmd = build_server_cmd()
-    print(f"[komari] exec: {' '.join(cmd)}")
-    os.execv(cmd[0], cmd)
+
+    port_env = os.environ.get("PORT", "").strip()
+    listen = os.environ.get("KOMARI_LISTEN") or f"0.0.0.0:{port_env or INTERNAL_PORT}"
+    cmd = build_server_cmd(listen)
+    print(f"[komari] starting: {' '.join(cmd)}")
+
+    proc = subprocess.Popen(cmd)
+
+    # 平台显式注入 PORT / KOMARI_LISTEN 时，komari 已直接监听目标端口，
+    # 无需额外转发；否则在常见入口端口上做 TCP 转发兜底，适配网关固定转发端口。
+    if not port_env and not os.environ.get("KOMARI_LISTEN"):
+        start_port_forwarders(INTERNAL_PORT, EXTRA_PORTS)
+
+    def shutdown(signum, frame):
+        proc.terminate()
+        raise SystemExit(0)
+
+    signal.signal(signal.SIGTERM, shutdown)
+    signal.signal(signal.SIGINT, shutdown)
+
+    exit_code = proc.wait()
+    sys.exit(exit_code)
 
 
 if __name__ == "__main__":
