@@ -1,0 +1,2 @@
+# komari 是预编译 Go 二进制，无 Python 依赖。
+# 本文件仅用于兼容 infrlo 平台默认构建命令 `pip install -r requirements.txt`。
