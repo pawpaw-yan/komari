@@ -12,13 +12,16 @@ Komari 是 Go 预编译单二进制程序，**前端已内嵌**，运行时只�
 
 | 配置项 | 填写内容 |
 |---|---|
-| Build Command | `pip install -r requirements.txt && python app.py --download-only` |
-| Run Command | `python app.py` |
+| Build Command | `pip install -r requirements.txt && (python3 app.py --download-only \|\| python app.py --download-only)` |
+| Run Command | `python3 app.py \|\| python app.py` |
 | 端口 | komari 默认监听 `0.0.0.0:25774`；若平台注入 `PORT` 环境变量则自动跟随 |
 
-> 即使 Build Command 保持默认 `pip install -r requirements.txt` 也能部署成功
-> （该文件为空依赖，仅作兼容占位），二进制会推迟到运行期首次启动时下载；
-> 但建议按上表在构建期预下载，启动更快，也不依赖运行环境的外网连通性。
+> **注意用 `python3`**：infrlo 的 Debian 系环境没有 `python` 命令（构建日志会报
+> `/bin/sh: 1: python: not found`），`pip` 能用不代表 `python` 存在。
+> 上面命令已做 `python3 → python` 双重兜底。
+
+> 即使 Build Command 里的下载步骤失败也能部署（运行期会重试），
+> 但建议构建期预下载，启动更快，也不依赖运行环境的外网连通性。
 
 ## 可选环境变量（在 infrlo 容器设置页添加）
 
@@ -30,6 +33,16 @@ Komari 是 Go 预编译单二进制程序，**前端已内嵌**，运行时只�
 | `KOMARI_LISTEN` | 监听地址，如 `0.0.0.0:8080` | `0.0.0.0:$PORT` |
 | `KOMARI_DATABASE` | SQLite 文件路径 | `./data/komari.db` |
 | `KOMARI_ARGS` | 附加给 `komari server` 的参数（空格分隔） | 空 |
+
+## 排错
+
+- **平台显示 ONLINE / Deployment Successful 但打不开（502）**：只代表容器进程在跑，
+  不代表 komari 已监听。去 Logs 页看真实日志；最常见原因是 `python: not found`
+  （改用 `python3`）或下载二进制失败（设 `KOMARI_DOWNLOAD_URL` 走镜像）。
+- **容器内完全没有 python3** 的兜底方案：不依赖 Python，直接在
+  Build Command 用 curl/wget 拉二进制（x86 容器）：
+  `curl -fsSL -o komari https://github.com/komari-monitor/komari/releases/download/1.5.0-fix1/komari-linux-amd64 && chmod +x komari`
+  Run Command 改为：`./komari server --listen 0.0.0.0:${PORT:-25774}`
 
 ## 数据持久化
 
